@@ -5,9 +5,9 @@ os.environ["DEBUG"] = "6"
 from tinygrad import dtypes
 from tinygrad import Tensor
 
-dtype = dtypes.int
+dtype = dtypes.int32
 
-height = 24
+height = 16
 width  = height
 
 v0 = []
@@ -19,5 +19,5 @@ for i in range(height * width):
 t0 = Tensor(v0, dtype=dtype).reshape(height, width)
 t1 = Tensor(v1, dtype=dtype).reshape(width, height)
 
-t2 = t0 * t1
+t2 = t0 + t1
 print(t2.numpy())

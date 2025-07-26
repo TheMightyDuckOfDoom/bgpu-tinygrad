@@ -52,14 +52,6 @@ asm_for_op: dict[Ops, Callable] = {
   Ops.SHR: lambda d,a,b,name: f"shr.{name[1:]} {d}, {a}, {b}",
 }
 
-bgpu_legalizer = PatternMatcher([
-  # Allow indexed loads and stores [reg + reg]
-  (UPat(Ops.LOAD, name="x", src=(UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var("idx"))))),
-   lambda buf,idx,x: UOp.load(buf, idx, dtype=x.dtype)),
-  (UPat(Ops.STORE, src=(UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var("idx"))), UPat.var("val"))),
-   lambda buf,idx,val: UOp.store(buf, idx, val)),
-])
-
 def mem_type(x: UOp): return 'global'
 
 asm_rewrite = PatternMatcher([
@@ -69,35 +61,17 @@ asm_rewrite = PatternMatcher([
   # Load with just a base address-> ld
   (UPat(Ops.LOAD, name="x", src=(UPat.var('base')), allow_any_len=True),
    lambda ctx, x, base: None \
-     if x.dtype.count > 1 else f"ld.ri.{ctx.types[x.dtype]}.{mem_type(x)}\t{ctx.r[x].rjust(4)}, {ctx.r[base].rjust(4)} [0]"),
-
-  # Load with a base address and an immediate offset, offset is in number of elements
-  (UPat(Ops.LOAD, name="x", src=(UPat.var('base'), UPat(Ops.CONST, src=(UPat.var("idx")))), allow_any_len=True),
-   lambda ctx, x, base, idx: None \
-     if x.dtype.count > 1 else f"ld.ri.{ctx.types[x.dtype]}.{mem_type(x)}\t{ctx.r[x].rjust(4)}, {ctx.r[base].rjust(4)} [{idx.arg}]"),
-
-  # Load with a base address and register offset, offset is in number of elements
-  (UPat(Ops.LOAD, name="x", src=(UPat.var('base'), UPat.var("idx")), allow_any_len=True),
-   lambda ctx, x, base, idx: None \
-     if x.dtype.count > 1 else f"ld.rr.{ctx.types[x.dtype]}.{mem_type(x)}\t{ctx.r[x].rjust(4)}, {ctx.r[base].rjust(4)} [{ctx.r[idx]}]"),
-
-  # Store with a base address and an immediate offset, offset is in number of elements
-  (UPat(Ops.STORE, src=(UPat.var('base'), UPat(Ops.CONST, src=(UPat.var("idx"))), UPat.var("var")), allow_any_len=True), lambda ctx, base, idx, var: 
-    None if var.dtype.count > 1 else
-    f"st.ri.{ctx.types[var.dtype.scalar()]}.{mem_type(base)}\t" + \
-    f"{ctx.r[base].rjust(4)} [{idx}], {('{' + ', '.join(ctx.r[var]) + '}') if var.dtype.count > 1 else ctx.r[var].rjust(4)}"),
-
-  # Store with a base address and register offset, offset is in number of elements
-  (UPat(Ops.STORE, src=(UPat.var('base'), UPat.var("idx"), UPat.var("var")), allow_any_len=True), lambda ctx, base, idx, var:
-    None if var.dtype.count > 1 else
-    f"st.rr.{ctx.types[var.dtype.scalar()]}.{mem_type(base)}\t" + \
-    f"{ctx.r[base].rjust(4)} [{ctx.r[idx]}], {('{' + ', '.join(ctx.r[var]) + '}') if var.dtype.count > 1 else ctx.r[var].rjust(4)}"),
+     if x.dtype.count > 1 else f"ld.{ctx.types[x.dtype]}.{mem_type(x)}\t\t{ctx.r[x].rjust(4)}, {ctx.r[base].rjust(4)}"),
 
   # Store with a just a base address
   (UPat(Ops.STORE, src=(UPat.var('base'), UPat.var("var")), allow_any_len=True), lambda ctx, base, var:
     None if var.dtype.count > 1 else
-    f"st.ri.{ctx.types[var.dtype.scalar()]}.{mem_type(base)}\t" + \
-    f"[{ctx.r[base].rjust(4)} [0], {('{' + ', '.join(ctx.r[var]) + '}') if var.dtype.count > 1 else ctx.r[var].rjust(4)}"),
+    f"st.{ctx.types[var.dtype.scalar()]}.{mem_type(base)}\t\t" + \
+    f"{ctx.r[base].rjust(4)}, {('{' + ', '.join(ctx.r[var]) + '}') if var.dtype.count > 1 else ctx.r[var].rjust(4)}"),
+
+  # MUL register constant
+  (UPat(Ops.MUL, name="x", src=(UPat.var('a'))),
+    lambda ctx, x, a: f"shl.ri.{ctx.types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)}, {render_val(math.log2(x.arg), x.dtype).rjust(4)}" if x.arg.bit_count() == 1 else None),
 
   # ALU register register
   (UPat(GroupOp.ALU, name="x", src=(UPat.var('a'), UPat.var('b')), allow_any_len=True),
@@ -108,11 +82,19 @@ asm_rewrite = PatternMatcher([
    lambda ctx, x, a: f"{x.op.name.lower()}.ri.{ctx.types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)}, {render_val(x.arg, x.dtype).rjust(4)}"),
 
   # Parameter
-  (UPat(Ops.DEFINE_GLOBAL, name="x", src=(UPat.var('param'))), lambda ctx,x, param: f"ld.ri.{ctx.types[param.dtype]}.global\t{ctx.r[x].rjust(4)}, {ctx.r[param].rjust(4)} [{x.arg}]"),
+  (UPat(Ops.DEFINE_GLOBAL, name="x", src=(UPat.var('param'))), lambda ctx,x, param:
+    [f"\tadd.ri.{ctx.types[bgpu_addr_type]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[param].rjust(4)}, {x.arg * 4}",
+      f"\tld.{ctx.types[param.dtype]}.global\t\t{ctx.r[x].rjust(4)}, {ctx.r[x].rjust(4)}"]
+    if x.arg != 0 else
+    f"ld.{ctx.types[param.dtype]}.global\t\t{ctx.r[x].rjust(4)}, {ctx.r[param].rjust(4)}"),
+
+  # Index
+  (UPat(Ops.INDEX, name="x", src=(UPat.var('a'), UPat.var('b'))),
+   lambda ctx, x, a, b: f"add.rr.{ctx.types[bgpu_addr_type]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)}, {ctx.r[b].rjust(4)}"),
 
   # Special
   (UPat(Ops.SPECIAL, name="x"), lambda ctx,x: 
-   f"ld.special\t\t{ctx.r[x].rjust(4)}, %{x.arg[0]}"
+   f"special\t\t\t{ctx.r[x].rjust(4)}, %{x.arg[0]}"
   ),
 
   # Sink
@@ -123,7 +105,6 @@ asm_rewrite = PatternMatcher([
 class BGPURenderer(Renderer):
   device = "BGPU"
   suffix = ".bgpu"
-  code_for_op = asm_for_op
   has_shared = True
   has_local = True
   shared_max = 0
@@ -131,7 +112,6 @@ class BGPURenderer(Renderer):
   special_loopidx_dtype = bgpu_widest_type
   global_max = (bgpu_global_size, 1, 1)
   local_max = (bgpu_local_size, 1, 1)
-  extra_matcher = bgpu_legalizer
 
   types: dict[DType, str] = { dtypes.char: "int8", dtypes.uchar: "uint8", dtypes.short: "int16", dtypes.int: "int32", dtypes.uint: "uint32" }
 
