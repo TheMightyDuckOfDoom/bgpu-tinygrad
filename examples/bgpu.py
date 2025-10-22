@@ -7,8 +7,8 @@ from tinygrad import Tensor
 
 dtype = dtypes.int32
 
-height = 16
-width  = height
+height = 64
+width  = 2
 
 v0 = []
 v1 = []
@@ -19,5 +19,5 @@ for i in range(height * width):
 t0 = Tensor(v0, dtype=dtype).reshape(height, width)
 t1 = Tensor(v1, dtype=dtype).reshape(width, height)
 
-t2 = t0 + t1
+t2 = t0.sum(axis=0)
 print(t2.numpy())

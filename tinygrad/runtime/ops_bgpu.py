@@ -4,7 +4,7 @@ from tinygrad.helpers import strip_parens
 from tinygrad.device import Compiled, LRUAllocator, BufferSpec
 from tinygrad.renderer import Renderer
 from tinygrad.uop.ops import UOp, Ops, GroupOp, PatternMatcher, UPat, print_uops, graph_rewrite
-from tinygrad.dtype import dtypes, DType, PtrDType
+from tinygrad.dtype import AddrSpace, dtypes, DType, PtrDType
 from tinygrad.runtime.ops_python import PythonAllocator
 import struct
 import math
@@ -12,7 +12,7 @@ import math
 bgpu_widest_type = dtypes.int
 bgpu_addr_type = dtypes.int
 
-bgpu_global_size = 256
+bgpu_global_size = 1 << 14
 bgpu_local_size = 4
 bgpu_max_registers = 256
 
@@ -55,6 +55,18 @@ asm_for_op: dict[Ops, Callable] = {
 def mem_type(x: UOp): return 'global'
 
 asm_rewrite = PatternMatcher([
+  # Range
+  (UPat(Ops.RANGE, name="x", src=(UPat.var('count'))), lambda ctx,x,count: f"mov.imm.{ctx.types[x.dtype]}\t{ctx.r[x]}, 0\nloop_{ctx.r[x]}:"),
+
+  # End Range
+  (UPat(Ops.ENDRANGE, name="x", src=(UPat.var('range'))), lambda ctx,x,range:
+    [f"checkloop_{ctx.r[range]}:",
+    f"\tadd.ri.{ctx.types[range.dtype]}\t{ctx.r[range]}, {ctx.r[range]}, 1", #  increment
+    f"\tsub.ri.{ctx.types[range.dtype]}\t{ctx.r[x]}, {ctx.r[range]}, {range.src[0].arg}", # compare
+    f"\tbr.nz.loop_{ctx.r[range]} {ctx.r[x]}", # branch if not zero
+    f"endloop_{ctx.r[range]}:"]
+  ),
+
   # Constants -> mov.imm
   (UPat.cvar("x"), lambda ctx, x: f"mov.imm.{ctx.types[x.dtype][0:]}\t{ctx.r[x]}, {render_val(x.arg, x.dtype)}"),
 
@@ -64,10 +76,16 @@ asm_rewrite = PatternMatcher([
      if x.dtype.count > 1 else f"ld.{ctx.types[x.dtype]}.{mem_type(x)}\t\t{ctx.r[x].rjust(4)}, {ctx.r[base].rjust(4)}"),
 
   # Store with a just a base address
-  (UPat(Ops.STORE, src=(UPat.var('base'), UPat.var("var")), allow_any_len=True), lambda ctx, base, var:
-    None if var.dtype.count > 1 else
+  (UPat(Ops.STORE, name="x", src=(UPat.var('base'), UPat.var("var")), allow_any_len=True), lambda ctx, x, base, var:
+    None if var.dtype.count > 1 or x.dtype.addrspace == AddrSpace.REG else
     f"st.{ctx.types[var.dtype.scalar()]}.{mem_type(base)}\t\t" + \
     f"{ctx.r[base].rjust(4)}, {('{' + ', '.join(ctx.r[var]) + '}') if var.dtype.count > 1 else ctx.r[var].rjust(4)}"),
+
+  # Store into a register -> mov.rr
+  (UPat(Ops.STORE, name="x", src=(UPat.var('base'), UPat.var("var")), allow_any_len=True), lambda ctx, x, base, var:
+    None if var.dtype.count > 1 or x.dtype.addrspace != AddrSpace.REG else
+    f"mov.rr\t\t\t" + \
+    f"{ctx.r[base.src[0]].rjust(4)}, {ctx.r[var].rjust(4)}"),
 
   # MUL register constant
   (UPat(Ops.MUL, name="x", src=(UPat.var('a'))),
@@ -97,6 +115,16 @@ asm_rewrite = PatternMatcher([
    f"special\t\t\t{ctx.r[x].rjust(4)}, %{x.arg[0]}"
   ),
 
+  # Define Register
+  (UPat(Ops.DEFINE_REG, name="x", src=(UPat.var('a'), UPat.var('b'))), lambda ctx,x,a,b:
+    f"mov.imm.{ctx.types[x.dtype.base.scalar()]}\t{ctx.r[x]}, {render_val(0, x.dtype.base.scalar())}"
+  ),
+
+  # Cast
+  (UPat(Ops.CAST, name="x", src=(UPat.var('a'))), lambda ctx,x,a:
+    f"cast.{ctx.types[x.dtype]}.{ctx.types[a.dtype]}\t{ctx.r[x]}, {ctx.r[a]}"
+  ),
+
   # Sink
   (UPat(Ops.SINK), lambda: "stop"),
 ]
@@ -105,15 +133,15 @@ asm_rewrite = PatternMatcher([
 class BGPURenderer(Renderer):
   device = "BGPU"
   suffix = ".bgpu"
-  has_shared = True
-  has_local = True
+  has_shared = False
+  has_local = False
   shared_max = 0
   supports_float4 = False
   special_loopidx_dtype = bgpu_widest_type
   global_max = (bgpu_global_size, 1, 1)
   local_max = (bgpu_local_size, 1, 1)
 
-  types: dict[DType, str] = { dtypes.char: "int8", dtypes.uchar: "uint8", dtypes.short: "int16", dtypes.int: "int32", dtypes.uint: "uint32" }
+  types: dict[DType, str] = { dtypes.void: "void", dtypes.char: "int8", dtypes.uchar: "uint8", dtypes.short: "int16", dtypes.int: "int32", dtypes.uint: "uint32", dtypes.bool: "bool", dtypes.float: "float32" }
 
   def render_kernel(self, function_name):
     kernel:list[str] = []
@@ -121,7 +149,7 @@ class BGPURenderer(Renderer):
     for u in self.uops:
       # Render instructions as assembly
       if (l:=cast(str|list[str], asm_rewrite.rewrite(u, ctx=self))) is None:
-        raise RuntimeError(f"failed to render {u.op} with {u.dtype} srcs {[x.dtype for x in u.src]}")
+        raise RuntimeError(f"failed to render {u.op} with {u.dtype} srcs {[x.dtype for x in u.src]}\nKernel: {'\n'.join(kernel)}")
 
       if l is not None and not (isinstance(l, str) and l == ""):
         kernel.extend(['\t' + l] if isinstance(l, str) else l)
@@ -136,14 +164,17 @@ class BGPURenderer(Renderer):
       if u in self.r:
         if self.r[u] not in self.r_lifetime:
           self.r_lifetime[self.r[u]] = (uop_idx, -1)
-        else:
-          self.r_lifetime[self.r[u]] = (self.r_lifetime[self.r[u]][0], uop_idx)
+        # else:
+        #   self.r_lifetime[self.r[u]] = (self.r_lifetime[self.r[u]][0], uop_idx)
 
       for src in u.src:
+        if src not in self.r:
+          print(f"Warning: source {src} not in registers")
+          continue
         if self.r[src] not in self.r_lifetime:
-          self.r_lifetime[self.r[src]] = (-1, uop_idx)
-        else:
-          self.r_lifetime[self.r[src]] = (self.r_lifetime[self.r[src]][0], uop_idx)
+          print(f"Warning: source {src} has no lifetime when used in uop {u}")
+          continue
+        self.r_lifetime[self.r[src]] = (self.r_lifetime[self.r[src]][0], uop_idx)
 
   def render(self, uops:list[UOp]) -> str:
     print("Rendering BGPU code")
@@ -172,7 +203,7 @@ class BGPURenderer(Renderer):
 
     print("\nStarting to render")
 
-    print("Legalizing uops...")
+    # print("Legalizing uops...")
     # actual_uops = []
     # for u in uops:
     #   l = bgpu_legalizer.rewrite(u, ctx=self)
@@ -182,31 +213,47 @@ class BGPURenderer(Renderer):
     #     actual_uops.append(u)
     # uops = actual_uops
 
-    print("Legalized uops:")
-    print_uops(uops)
+    # print("Legalized uops:")
+    # print_uops(uops)
 
     print("Extracting register information...")
     actual_uops = []
     param_address_loaded = False
     load_base_address = None
     for uop_idx, u in enumerate(uops):
+      # Sink Op
       if u.op is Ops.SINK:
         if u.arg is not None:
           function_name = u.arg.function_name
         actual_uops.append(UOp(Ops.SINK))
         continue
 
+      # Casts into same type or pointer casts are no-ops
       if u.op in {Ops.CAST, Ops.BITCAST} and (u.src[0].dtype == u.dtype or isinstance(u.src[0].dtype, PtrDType) or u.src[0].op is Ops.SPECIAL):
-        # Casts into same type or pointer casts are no-ops
         r[u] = r[u.src[0]]
         continue
 
+      # Back-to-back casts of the same type: intX -> intY -> intX
       if u.op is Ops.CAST and u.src[0].op is Ops.CAST and u.dtype == u.src[0].src[0].dtype:
-        # Back-to-back casts of the same type: intX -> intY -> intX
         r[u] = r[u.src[0].src[0]]
         continue
 
-      if u.op in asm_for_op:
+      # Load into index of register is just a move -> use the same register
+      if u.op is Ops.LOAD and u.src[0].op is Ops.INDEX and u.src[0].src[0].op is Ops.DEFINE_REG:
+        r[u] = r[u.src[0].src[0]]
+        continue
+
+      # Store into register (index, value, range)
+      if u.op is Ops.STORE and u.src[0].op is Ops.INDEX and u.src[0].src[0].op is Ops.DEFINE_REG:
+        u.src = [u.src[0].src[0], u.src[1]]  # Replace index with the DEFINE_REG
+        r[u] = r[u.src[0]] # Value is the value to store
+
+      # Load from a store into a register is just the value stored
+      if u.op is Ops.LOAD and u.src[0].op is Ops.STORE:
+        r[u] = r[u.src[0]] # Value is the second src of the store
+        continue
+
+      if u.op in {Ops.ADD, Ops.SUB, Ops.MUL, Ops.SHL, Ops.SHR}:
         # It is an ALU operation
         if u.src[1].op == Ops.CONST:
           # Remove the constant from src[1] and put it into the arguments
@@ -229,25 +276,32 @@ class BGPURenderer(Renderer):
       if u.op is Ops.SPECIAL:
         print(f"special register {u.arg[0]}")
         r[u] = "%" + u.arg[0]
+        continue
       elif u.op is Ops.LOAD:
         # assert u.src[0].dtype == bgpu_addr_type, f"address of load isn't {bgpu_addr_type} but {u.src[0].dtype}"
         r[u] = [ssa('val', dtype=self.types[u.dtype.scalar()]) for _ in range(u.dtype.count)] if u.dtype.count > 1 else ssa('val', u)
+        continue
       elif u.op is Ops.DEFINE_GLOBAL: 
         print(f"global {u.arg} of type {u.dtype}")
         bufs.append((f"data{u.arg}", u.dtype))
-
+      
       prefix, dtype = {
-          Ops.INDEX: ("idx", u.dtype),
+          Ops.ENDRANGE: ("range_cond", self.types[dtypes.int]),
+          Ops.RANGE: ("range", self.types[u.dtype.base.scalar()]),
+          Ops.INDEX: ("idx", self.types[u.dtype.base.scalar()]),
           Ops.CAST: ("cast", None),
           Ops.BITCAST: ("cast", None),
           Ops.CONST: ("const", None),
           Ops.DEFINE_GLOBAL: ("param", self.types[bgpu_widest_type]),
+          Ops.DEFINE_REG: ("reg", self.types[u.dtype.base.scalar()]),
           **{op: ("alu", None) for op in GroupOp.ALU}
         }.get(u.op, (None, None))
       if prefix:
         r[u] = ssa(prefix, u, dtype)
+        print(f"assigned register {r[u]} for uop {u.op}")
+      else:
+        print(f"Warning: no register assigned for uop {u.op}")
 
-      print_uops([u])
     self.uops = actual_uops
 
     print("Uops after extracting register information:")
@@ -264,12 +318,14 @@ class BGPURenderer(Renderer):
     for u in self.uops:
       if u in r:
         assert(r[u] in self.r_lifetime) # Has to have a lifetime
-        assert(self.r_lifetime[r[u]][0] != -1) # Has to have a start
+        if self.r_lifetime[r[u]][0] == -1:
+          raise RuntimeError(f"register {r[u]} has no start lifetime for uop {u}")
 
         if self.r_lifetime[r[u]][1] == -1:
-          # Never used
-          print(f"never used {r[u]}")
-          continue
+          if "range_cond_" not in r[u]:
+            # Never used
+            print(f"never used {r[u]}")
+            continue
       actual_uops.append(u)
     self.uops = actual_uops
 
@@ -292,12 +348,13 @@ class BGPURenderer(Renderer):
     reg_to_schedule = list(self.r_lifetime)[reg_idx]
     assert(self.r_lifetime[reg_to_schedule][0] == 0) # First register has to start at 0
     while(len(r_to_ar) < len(self.r_lifetime)):
+      # TODO: This does not work if there are loops -> we just never free registers
       # Check if we can free a register
       # If the register is used last in current uop, then we can use it as destination for this uop
-      for free_reg in ar_lifetime:
-        if ar_lifetime[free_reg] == uop_idx:
-          print(f"freeing {free_reg}")
-          ar_lifetime[free_reg] = -1
+      #for free_reg in ar_lifetime:
+        #if ar_lifetime[free_reg] == uop_idx:
+          #print(f"freeing {free_reg}")
+          #ar_lifetime[free_reg] = -1
 
       # Schedule the register
       if reg_idx >= len(self.r_lifetime):
