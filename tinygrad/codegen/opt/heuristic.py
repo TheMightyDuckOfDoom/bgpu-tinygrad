@@ -165,7 +165,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       to_local: list[tuple[int, int]] = []
       for _, axis in sorted(local_axis_ranking, key=lambda x: (-x[0], -x[1])):
         local_size = prod(sz for _, sz in to_local)
-        local_sz: int|None = next((x for x in ([32] * (axis == 0) + [16,8,4,3,2]) if k.full_shape[axis] % x == 0 and local_size * x <= 128), None)
+        local_sz: int|None = next((x for x in ([32] * (axis == 0) + [16,8,4,3,2]) if k.full_shape[axis] % x == 0 and local_size * x <= k.ren.local_max[0]), None)
         if local_sz is not None: to_local.append((axis, local_sz))
       deleted_shape = 0
       for axis, local_sz in sorted(to_local[:3]):
