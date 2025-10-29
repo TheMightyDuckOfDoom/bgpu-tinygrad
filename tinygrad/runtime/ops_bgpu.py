@@ -7,7 +7,7 @@ from tinygrad.uop.ops import UOp, Ops, GroupOp, PatternMatcher, UPat, print_uops
 from tinygrad.dtype import AddrSpace, dtypes, DType, PtrDType
 from tinygrad.runtime.ops_python import PythonAllocator
 
-from bgpu_assembler import asm2hex
+from bgpu_assembler import BGPUAssembler
 from bgpu_driver import BGPUDriver
 
 import struct
@@ -19,7 +19,7 @@ bgpu_addr_type = dtypes.int
 
 bgpu_global_size = 1 << 24
 bgpu_local_size = 4
-bgpu_max_registers = 1 << 16 #256
+bgpu_max_registers = 256
 
 emulate = False
 
@@ -35,7 +35,7 @@ class BGPUProgram:
       raise ValueError(f"global_size {global_size} or local_size {local_size} exceeds maximums ({bgpu_global_size}, 1, 1) and ({bgpu_local_size}, 1, 1)")
 
     # Compile the kernel
-    program = asm2hex(self.lib.decode("utf-8"))
+    program = BGPUAssembler().assemble_lines(self.lib.decode("utf-8").splitlines())
 
     # Run the kernel
     self.device.driver.run_kernel(args, global_size=global_size, local_size=local_size, program=program, function_name=self.function_name)
@@ -125,7 +125,7 @@ asm_rewrite = PatternMatcher([
   # Store register into a register -> mov.rr
   (UPat(Ops.STORE, name="x", src=(UPat.var('base'), UPat.var("var"))), lambda ctx, x, base, var:
     None if var.dtype.count > 1 or x.arg is None or x.arg.op != Ops.DEFINE_REG else
-    f"mov.rr\t\t\t" + \
+    f"mov.rr.{ctx.types[x.dtype]}\t\t\t" + \
     f"{ctx.r[x.arg].rjust(4)}, {ctx.r[var].rjust(4)} # store register into register"),
 
   # ALU register register
