@@ -326,6 +326,8 @@ class Compiled:
 def is_dtype_supported(dtype:DType, device:str|None=None) -> bool:
   if dtype == dtypes.index: return False
   if device is None: device = Device.DEFAULT
+  # BGPU doesn't support long
+  if device is "BGPU" and dtype == dtypes.long: return False
   if dtype == dtypes.bfloat16:
     if device == "METAL": return not CI
     if device in {"CUDA", "NV"}: return not CI and not getenv(f"{device}_PTX") and not getenv("NV_NAK")
