@@ -1,7 +1,6 @@
 import os
-# os.environ["BGPU"] = "1"
+os.environ["BGPU"] = "1"
 os.environ["DEBUG"] = "7"
-os.environ["NOOPT"] = "0"
 
 from tinygrad import dtypes
 from tinygrad import Tensor

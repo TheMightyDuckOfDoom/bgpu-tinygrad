@@ -6,6 +6,9 @@ from tinygrad.uop.ops import Ops, resolve, AxisType
 from tinygrad.codegen.opt.postrange import Scheduler
 
 def hand_coded_optimizations(k:Scheduler) -> Scheduler:
+  import os
+  if os.environ.get("BGPU") == "1":
+    return k
   # first try the tensor cores
   """ Attempts to apply a tensor core optimization to the kernel. If one exists and applies properly, return true, otherwise return false.
   Tensor cores are optimized instructions that matrix multiply-accumulate across a wave of threads: D(M, N) = A(M, K) * B(K, N) + C(M, N).

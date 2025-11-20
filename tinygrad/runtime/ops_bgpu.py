@@ -90,16 +90,17 @@ asm_rewrite = PatternMatcher([
    lambda ctx, x, base: None \
      if x.dtype.count > 1 else f"ld.{ctx.types[x.dtype]}.{mem_type(x)}\t\t{ctx.r[x].rjust(4)}, {ctx.r[base].rjust(4)}"),
 
-  # Gated index
+  # Gated index -> no-op as it is handled in a gated load
   (UPat(Ops.INDEX, name="x", src=(UPat.var("buf"), UPat.var("loc"), UPat.var("gate"))),
     lambda ctx, x, loc, gate, buf: f"# Gated index {ctx.r[x]}"),
 
   # Gated Load
   (UPat(Ops.LOAD, name="x", src=(UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var("loc"), UPat.var("gate"))), UPat.var("alt"))),
     lambda ctx, x, loc, alt, gate, buf: 
-    None if x.dtype.count > 1 else [f"\tmov.rr {ctx.r[x].rjust(4)}, {ctx.r[alt].rjust(4)} # load alternative",
+    None if x.dtype.count > 1 else [f"\tmov.rr.{ctx.types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[alt].rjust(4)} # load alternative",
     f"\tbr.ez.load_{ctx.r[x]} {ctx.r[gate].rjust(4)} # if gate is zero, skip load",
-    f"\tadd.rr.{ctx.types[bgpu_addr_type]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[buf].rjust(4)}, {ctx.r[loc].rjust(4)} # index into buffer",
+    f"\tshl.ri.{ctx.types[bgpu_addr_type]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[loc].rjust(4)}, {render_val(math.log2(buf.dtype.base.scalar().itemsize), bgpu_addr_type)} # index shift",
+    f"\tadd.rr.{ctx.types[bgpu_addr_type]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[buf].rjust(4)}, {ctx.r[x].rjust(4)} # index into buffer",
     f"\tld.{ctx.types[x.dtype]}.{mem_type(x)}\t\t{ctx.r[x].rjust(4)}, {ctx.r[x].rjust(4)} # load",
     f"load_{ctx.r[x]}: # skip label for load",
     "\tsync.threads"
@@ -125,8 +126,12 @@ asm_rewrite = PatternMatcher([
   # Store register into a register -> mov.rr
   (UPat(Ops.STORE, name="x", src=(UPat.var('base'), UPat.var("var"))), lambda ctx, x, base, var:
     None if var.dtype.count > 1 or x.arg is None or x.arg.op != Ops.DEFINE_REG else
-    f"mov.rr.{ctx.types[x.dtype]}\t\t\t" + \
+    f"mov.rr.{ctx.types[var.dtype]}\t\t\t" + \
     f"{ctx.r[x.arg].rjust(4)}, {ctx.r[var].rjust(4)} # store register into register"),
+
+  # ALU register register
+  (UPat({Ops.CMPLT, Ops.CMPEQ, Ops.CMPNE}, name="x", src=(UPat.var('a'), UPat.var('b'))),
+   lambda ctx, x, a, b: f"{x.op.name.lower()}.rr.{ctx.types[a.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)}, {ctx.r[b].rjust(4)}"),
 
   # ALU register register
   (UPat(GroupOp.ALU, name="x", src=(UPat.var('a'), UPat.var('b'))),
@@ -271,12 +276,15 @@ class BGPURenderer(Renderer):
 
     print("Extracting register information...")
     actual_uops = []
-    param_address_loaded = False
-    load_base_address = None
+    has_range = False
     for uop_idx, u in enumerate(uops):
       # Noop
       if u.op is Ops.NOOP:
         continue
+
+      # Range
+      if u.op is Ops.RANGE:
+        has_range = True
 
       # Sink Op
       if u.op is Ops.SINK:
@@ -429,14 +437,6 @@ class BGPURenderer(Renderer):
     reg_to_schedule = list(self.r_lifetime)[reg_idx]
     assert(self.r_lifetime[reg_to_schedule][0] == 0) # First register has to start at 0
     while(len(r_to_ar) < len(self.r_lifetime)):
-      # TODO: This does not work if there are loops -> we just never free registers
-      # Check if we can free a register
-      # If the register is used last in current uop, then we can use it as destination for this uop
-      # for free_reg in ar_lifetime:
-      #   if ar_lifetime[free_reg] == uop_idx:
-      #     print(f"freeing {free_reg}")
-      #     ar_lifetime[free_reg] = -1
-
       # Schedule the register
       if reg_idx >= len(self.r_lifetime):
         raise RuntimeError(f"index {reg_idx} out of bounds {len(self.r_lifetime)}")
@@ -452,6 +452,15 @@ class BGPURenderer(Renderer):
           assert(i != bgpu_max_registers) # No free registers
         # Goto next register
         reg_idx += 1
+
+      if not has_range:
+      # TODO: This does not work if there are loops -> we just never free registers
+      # Check if we can free a register
+      # If the register is used last in current uop, then we can use it as destination for this uop
+        for free_reg in ar_lifetime:
+          if ar_lifetime[free_reg] == uop_idx:
+            print(f"freeing {free_reg}")
+            ar_lifetime[free_reg] = -1
 
       uop_idx += 1
 
