@@ -318,6 +318,11 @@ class BGPURenderer(Renderer):
         r[u] = r[u.src[0].src[0]]
         continue
 
+      # Cast from bool to int is a no-op
+      if u.op is Ops.CAST and u.src[0].dtype == dtypes.bool and dtypes.is_integer(u.dtype):
+        r[u] = r[u.src[0]]
+        continue
+
       # Index with an after pointing to a register
       if u.op is Ops.INDEX and u.src[0].op is Ops.AFTER and u.src[0].src[0].op is Ops.DEFINE_REG:
         u.src = [u.src[0].src[0], u.src[1]] # Replace AFTER with DEFINE_REG
