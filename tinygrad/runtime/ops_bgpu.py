@@ -19,6 +19,7 @@ bgpu_global_size = 1 << 16
 bgpu_local_size = 8
 bgpu_max_registers = 256
 new_codegen = True
+DEAD_CODE_ELIMINATION = True
 
 class BGPUProgram:
   def __init__(self, device, name:str, lib:bytes): self.device, self.function_name, self.lib = device, name, lib
@@ -184,14 +185,15 @@ asm_rewrite = PatternMatcher([
 )
 
 class Quadruple:
-  def __init__(self, op: str, dst=None, srcs=[], args=[]):
+  def __init__(self, op: str, dst=None, srcs=[], args=[], never_dead=False):
     self.op = op
     self.dst = dst
     self.srcs = srcs
     self.args = args
+    self.dead = False # set to true by dead code elimination and then not printed
+    self.never_dead = never_dead # for instructions that must not be eliminated (like stores, branches)
     self.pred = []
     self.succ = []
-    self.dead = False
   
   def defs(self):
     return set() if self.dst is None else set([self.dst])
@@ -232,6 +234,7 @@ class BasicBlock:
     res = f"{self.label}: # pred: {" ".join(self.pred)}\n"
     for inst in self.insts:
       if inst.dead:
+        assert not inst.never_dead, "Dead code elimination removed an instruction that should not be removed!"
         continue
       res += "\t" + str(inst) + "\n"
     if "stop" in self.succ:
@@ -316,7 +319,9 @@ class Cfg:
     for uid in self.inst_map:
       inst = self.inst_map[uid]
       required_registers = max(required_registers, len(inst.in_set | inst.out_set))
-      print(f"inst {uid}: in: {inst.in_set} out: {inst.out_set}")
+      if not inst.never_dead and DEAD_CODE_ELIMINATION:
+        inst.dead = (inst.defs() & inst.out_set) == set()
+      print(f"inst {uid}, dead: {inst.dead}: in: {inst.in_set} out: {inst.out_set}")
     
     print(f"Required registers: {required_registers}")
 
@@ -440,7 +445,7 @@ class Cfg:
           current_bblock_insts.append(Quadruple(f"mov.rr.{types[uop.src[0].dtype.base]}", uop_to_ssa[uop.src[0]], srcs=[uop_to_ssa[uop.src[1]]]))
           uop_to_ssa[uop] = uop_to_ssa[uop.src[0]]
         else:
-          current_bblock_insts.append(Quadruple(f"st.{types[uop.src[0].dtype.base]}.global", None, srcs=get_srcs(uop)))
+          current_bblock_insts.append(Quadruple(f"st.{types[uop.src[0].dtype.base]}.global", None, srcs=get_srcs(uop), never_dead=True))
       elif uop.op is Ops.RANGE:
         if uop.src[0].arg <= 0:
           raise RuntimeError(f"Range has 0 or fewer iterations: {uop.src[0].arg}")
@@ -465,7 +470,7 @@ class Cfg:
             Quadruple("phi", range_name, srcs=[f"{range_name}_phi", counter_init_name]),
             Quadruple(f"add.ri.{types[uop.dtype]}", f"{range_name}_phi", srcs=[range_name], args="1"),
             Quadruple(f"sub.ri.{types[uop.dtype]}", f"{range_name}_cmp", srcs=[f"{range_name}_phi"], args=uop.src[0].arg+1),
-            Quadruple(f"br.ez.{loop_exit_name}", srcs=[f"{range_name}_cmp"])
+            Quadruple(f"br.ez.{loop_exit_name}", srcs=[f"{range_name}_cmp"], never_dead=True)
           ],
           [loop_body_name, loop_exit_name])
         )
@@ -486,7 +491,7 @@ class Cfg:
         )
         # loop footer jumps to loop check
         bblocks.append(
-          BasicBlock(loop_footer_name, [Quadruple(f"br.nz.{loop_check_name}", srcs=[f"{range_name}_cmp"])], [loop_check_name])
+          BasicBlock(loop_footer_name, [Quadruple(f"br.nz.{loop_check_name}", srcs=[f"{range_name}_cmp"], never_dead=True)], [loop_check_name])
         )
         # start loop exit block
         current_bblock_label = loop_exit_name
@@ -521,12 +526,12 @@ class BGPURenderer(Renderer):
   suffix = ".bgpu"
   supports_float4 = False
   has_local = True
-  has_threads = True
+  has_threads = False
   has_shared = False
   global_max = (bgpu_global_size, 1, 1)
   local_max = (bgpu_local_size, 1, 1)
   shared_max = 0
-  tensor_coes = []
+  tensor_cores = []
   pre_matcher = None
   extra_matcher = None
   code_for_op = asm_for_op
