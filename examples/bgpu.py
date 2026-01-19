@@ -1,5 +1,5 @@
 import os
-os.environ["BGPU"] = "1"
+os.environ["BGPU"] = "1" if os.getenv("CPU", "0") == "0" else "0"
 os.environ["DEBUG"] = "7"
 
 from tinygrad import dtypes

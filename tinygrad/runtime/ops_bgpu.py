@@ -3,7 +3,7 @@ from collections import defaultdict
 from tinygrad.device import Compiled, LRUAllocator, BufferSpec, Compiler, CompilerSet, CompilerPair
 from tinygrad.renderer import Renderer
 from tinygrad.uop.ops import UOp, Ops, GroupOp, PatternMatcher, UPat, print_uops
-from tinygrad.dtype import dtypes, DType, PtrDType
+from tinygrad.dtype import dtypes, DType, PtrDType, AddrSpace
 
 from bgpu_assembler import BGPUAssembler
 from bgpu_driver import BGPUDriver
@@ -15,9 +15,10 @@ import functools
 bgpu_widest_type = dtypes.int
 bgpu_addr_type = dtypes.int
 
-bgpu_global_size = 1 << 24
-bgpu_local_size = 4
+bgpu_global_size = 1 << 16
+bgpu_local_size = 8
 bgpu_max_registers = 256
+new_codegen = True
 
 class BGPUProgram:
   def __init__(self, device, name:str, lib:bytes): self.device, self.function_name, self.lib = device, name, lib
@@ -65,26 +66,38 @@ asm_for_op: dict[Ops, Callable] = {
 
 def mem_type(x: UOp): return 'global'
 
+types: dict[DType, str] = {
+  dtypes.void: "void",
+  dtypes.char: "int8",
+  dtypes.uchar: "uint8",
+  dtypes.short: "int16",
+  dtypes.int: "int32",
+  dtypes.uint: "uint32",
+  dtypes.bool: "bool",
+  dtypes.float: "float32",
+  dtypes.long: "long"
+}
+
 asm_rewrite = PatternMatcher([
   # Range with constant bound
-  (UPat(Ops.RANGE, name="x", allow_any_len=True), lambda ctx,x: f"mov.ri.{ctx.types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {"0".rjust(4)} # init range\nloop_{ctx.r[x]}:"),
+  (UPat(Ops.RANGE, name="x", allow_any_len=True), lambda ctx,x: f"mov.ri.{types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {"0".rjust(4)} # init range\nloop_{ctx.r[x]}:"),
 
   # End Range
   (UPat(Ops.END, name="x", src=(UPat.var('last_op'), UPat.var('range'))), lambda ctx,x,last_op,range:
     [f"checkloop_{ctx.r[range]}:",
-    f"\tadd.ri.{ctx.types[range.dtype]}\t\t{ctx.r[range].rjust(4)}, {ctx.r[range].rjust(4)}, {"1".rjust(4)} # increment",
-    f"\tsub.rr.{ctx.types[range.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[range].rjust(4)}, {ctx.r[range.src[0]].rjust(4)} # compare bound",
+    f"\tadd.ri.{types[range.dtype]}\t\t{ctx.r[range].rjust(4)}, {ctx.r[range].rjust(4)}, {"1".rjust(4)} # increment",
+    f"\tsub.rr.{types[range.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[range].rjust(4)}, {ctx.r[range.src[0]].rjust(4)} # compare bound",
     f"\tbr.nz.loop_{ctx.r[range]}\t\t{ctx.r[x].rjust(4)} # loop back if not done",
     f"endloop_{ctx.r[range]}:"]
   ),
 
   # Constants -> mov.ri
-  (UPat.cvar("x"), lambda ctx, x: f"mov.ri.{ctx.types[x.dtype][0:]}\t{ctx.r[x].rjust(4)}, {render_val(x.arg, x.dtype)} # constant"),
+  (UPat.cvar("x"), lambda ctx, x: f"mov.ri.{types[x.dtype][0:]}\t{ctx.r[x].rjust(4)}, {render_val(x.arg, x.dtype)} # constant"),
 
   # Load with just a base address-> ld
   (UPat(Ops.LOAD, name="x", src=(UPat.var('base'))),
    lambda ctx, x, base: None \
-     if x.dtype.count > 1 else f"ld.{ctx.types[x.dtype]}.{mem_type(x)}\t\t{ctx.r[x].rjust(4)}, {ctx.r[base].rjust(4)}"),
+     if x.dtype.count > 1 else f"ld.{types[x.dtype]}.{mem_type(x)}\t\t{ctx.r[x].rjust(4)}, {ctx.r[base].rjust(4)}"),
 
   # Gated index -> no-op as it is handled in a gated load
   (UPat(Ops.INDEX, name="x", src=(UPat.var("buf"), UPat.var("loc"), UPat.var("gate"))),
@@ -93,11 +106,11 @@ asm_rewrite = PatternMatcher([
   # Gated Load
   (UPat(Ops.LOAD, name="x", src=(UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var("loc"), UPat.var("gate"))), UPat.var("alt"))),
     lambda ctx, x, loc, alt, gate, buf: 
-    None if x.dtype.count > 1 else [f"\tmov.rr.{ctx.types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[alt].rjust(4)} # load alternative",
+    None if x.dtype.count > 1 else [f"\tmov.rr.{types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[alt].rjust(4)} # load alternative",
     f"\tbr.ez.load_{ctx.r[x]} {ctx.r[gate].rjust(4)} # if gate is zero, skip load",
-    f"\tshl.ri.{ctx.types[bgpu_addr_type]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[loc].rjust(4)}, {render_val(math.log2(buf.dtype.base.scalar().itemsize), bgpu_addr_type)} # index shift",
-    f"\tadd.rr.{ctx.types[bgpu_addr_type]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[buf].rjust(4)}, {ctx.r[x].rjust(4)} # index into buffer",
-    f"\tld.{ctx.types[x.dtype]}.{mem_type(x)}\t\t{ctx.r[x].rjust(4)}, {ctx.r[x].rjust(4)} # load",
+    f"\tshl.ri.{types[bgpu_addr_type]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[loc].rjust(4)}, {render_val(math.log2(buf.dtype.base.scalar().itemsize), bgpu_addr_type)} # index shift",
+    f"\tadd.rr.{types[bgpu_addr_type]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[buf].rjust(4)}, {ctx.r[x].rjust(4)} # index into buffer",
+    f"\tld.{types[x.dtype]}.{mem_type(x)}\t\t{ctx.r[x].rjust(4)}, {ctx.r[x].rjust(4)} # load",
     f"load_{ctx.r[x]}: # skip label for load",
     "\tsync.threads"
     ]),
@@ -106,9 +119,9 @@ asm_rewrite = PatternMatcher([
   (UPat(Ops.WHERE, name="x", src=(UPat.var('cond'), UPat.var('a'), UPat.var('b'))),
     lambda ctx, x, cond, a, b:
     None if x.dtype.count > 1 else [
-      f"\tmov.rr.{ctx.types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[b].rjust(4)} # where false case",
+      f"\tmov.rr.{types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[b].rjust(4)} # where false case",
       f"\tbr.ez.where_{ctx.r[x]} {ctx.r[cond].rjust(4)} # if cond is zero, skip true case",
-      f"\tmov.rr.{ctx.types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)} # where true case",
+      f"\tmov.rr.{types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)} # where true case",
       f"where_{ctx.r[x]}: # skip label for where",
       "\tsync.threads"
       ]),
@@ -116,40 +129,40 @@ asm_rewrite = PatternMatcher([
   # Store with a just a base address
   (UPat(Ops.STORE, name="x", src=(UPat.var('base'), UPat.var("var"))), lambda ctx, x, base, var:
     None if var.dtype.count > 1 or x.arg is not None else
-    f"st.{ctx.types[var.dtype.scalar()]}.{mem_type(base)}\t\t" + \
+    f"st.{types[var.dtype.scalar()]}.{mem_type(base)}\t\t" + \
     f"{ctx.r[base].rjust(4)}, {('{' + ', '.join(ctx.r[var]) + '}') if var.dtype.count > 1 else ctx.r[var].rjust(4)}"),
 
   # Store register into a register -> mov.rr
   (UPat(Ops.STORE, name="x", src=(UPat.var('base'), UPat.var("var"))), lambda ctx, x, base, var:
     None if var.dtype.count > 1 or x.arg is None or x.arg.op != Ops.DEFINE_REG else
-    f"mov.rr.{ctx.types[var.dtype]}\t\t\t" + \
+    f"mov.rr.{types[var.dtype]}\t\t\t" + \
     f"{ctx.r[x.arg].rjust(4)}, {ctx.r[var].rjust(4)} # store register into register"),
 
   # ALU register register
   (UPat({Ops.CMPLT, Ops.CMPEQ, Ops.CMPNE}, name="x", src=(UPat.var('a'), UPat.var('b'))),
-   lambda ctx, x, a, b: f"{x.op.name.lower()}.rr.{ctx.types[a.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)}, {ctx.r[b].rjust(4)}"),
+   lambda ctx, x, a, b: f"{x.op.name.lower()}.rr.{types[a.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)}, {ctx.r[b].rjust(4)}"),
 
   # ALU register register
   (UPat(GroupOp.ALU, name="x", src=(UPat.var('a'), UPat.var('b'))),
-   lambda ctx, x, a, b: f"{x.op.name.lower()}.rr.{ctx.types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)}, {ctx.r[b].rjust(4)}"),
+   lambda ctx, x, a, b: f"{x.op.name.lower()}.rr.{types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)}, {ctx.r[b].rjust(4)}"),
 
   # ALU register constant
   (UPat(GroupOp.ALU, name="x", src=(UPat.var('a'))),
-   lambda ctx, x, a: None if x.arg == None else f"{x.op.name.lower()}.ri.{ctx.types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)}, {render_val(x.arg, x.dtype).rjust(4)}"),
+   lambda ctx, x, a: None if x.arg == None else f"{x.op.name.lower()}.ri.{types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)}, {render_val(x.arg, x.dtype).rjust(4)}"),
 
   # ALU register
   (UPat(GroupOp.ALU, name="x", src=(UPat.var('a'))),
-   lambda ctx, x, a: f"{x.op.name.lower()}.rr.{ctx.types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)}"),
+   lambda ctx, x, a: f"{x.op.name.lower()}.rr.{types[x.dtype]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)}"),
 
   # Parameter
   (UPat(Ops.DEFINE_GLOBAL, name="x"), lambda ctx,x:
-    f"ldparam.{ctx.types[bgpu_addr_type]} {ctx.r[x].rjust(4)}, {x.arg} # define global"),
+    f"ldparam.{types[bgpu_addr_type]} {ctx.r[x].rjust(4)}, {x.arg} # define global"),
 
   # Index
   (UPat(Ops.INDEX, name="x", src=(UPat.var('a'), UPat.var('b'))),
    lambda ctx, x, a, b: [
-    f"\tshl.ri.{ctx.types[bgpu_addr_type]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[b].rjust(4)}, {render_val(math.log2(a.dtype.base.scalar().itemsize), bgpu_addr_type)} # index shift",
-    f"\tadd.rr.{ctx.types[bgpu_addr_type]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)}, {ctx.r[x].rjust(4)} # index"
+    f"\tshl.ri.{types[bgpu_addr_type]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[b].rjust(4)}, {render_val(math.log2(a.dtype.base.scalar().itemsize), bgpu_addr_type)} # index shift",
+    f"\tadd.rr.{types[bgpu_addr_type]}\t\t{ctx.r[x].rjust(4)}, {ctx.r[a].rjust(4)}, {ctx.r[x].rjust(4)} # index"
    ]),
 
   # Special
@@ -159,16 +172,349 @@ asm_rewrite = PatternMatcher([
 
   # Cast
   (UPat({Ops.CAST, Ops.BITCAST}, name="x", src=(UPat.var('a'))), lambda ctx,x,a:
-    f"cast.{ctx.types[x.dtype]}.{ctx.types[a.dtype]}\t{ctx.r[x]}, {ctx.r[a]}"
+    f"cast.{types[x.dtype]}.{types[a.dtype]}\t{ctx.r[x]}, {ctx.r[a]}"
   ),
 
   # Define Register
-  (UPat(Ops.DEFINE_REG, name="x"), lambda ctx, x: f"mov.ri.{ctx.types[x.dtype.base.scalar()][0:]}\t{ctx.r[x]}, {x.arg} # define register"),
+  (UPat(Ops.DEFINE_REG, name="x"), lambda ctx, x: f"mov.ri.{types[x.dtype.base.scalar()][0:]}\t{ctx.r[x]}, {x.arg} # define register"),
 
   # Sink
   (UPat(Ops.SINK), lambda: "stop"),
 ]
 )
+
+class Quadruple:
+  def __init__(self, op: str, dst=None, srcs=[], args=[]):
+    self.op = op
+    self.dst = dst
+    self.srcs = srcs
+    self.args = args
+    self.pred = []
+    self.succ = []
+    self.dead = False
+  
+  def defs(self):
+    return set() if self.dst is None else set([self.dst])
+
+  def uses(self):
+    return set(self.srcs)
+  
+  def __str__(self):
+    arg_str = str(self.args)
+    if isinstance(self.args, list):
+      arg_str = ", ".join(self.args)
+
+    dst_str = "" if self.dst is None else f"{self.dst}, "
+
+    sep_str = ""
+    if len(self.srcs) > 0 and arg_str != "":
+      sep_str = ", "
+
+    return f"{self.op} {dst_str}{", ".join(self.srcs)}{sep_str}{arg_str}"
+
+class BasicBlock:
+  def __init__(self, label: str, insts: list[Quadruple], succ: list[str]):
+    self.label = label
+    self.insts = insts
+    self.succ = succ
+    self.pred = []
+
+  def analyze(self):
+    # Create edges within the BasicBlock
+    for idx, inst in enumerate(self.insts):
+      if idx > 0:
+        inst.pred = [self.insts[idx-1]]
+
+      if idx < (len(self.insts)-1):
+        inst.succ = [self.insts[idx+1]]
+  
+  def __str__(self):
+    res = f"{self.label}: # pred: {" ".join(self.pred)}\n"
+    for inst in self.insts:
+      if inst.dead:
+        continue
+      res += "\t" + str(inst) + "\n"
+    if "stop" in self.succ:
+      res += "\tstop\n"
+    return res + f"\t# succ: {" ".join(self.succ)}\n"
+
+class Cfg:
+  def __init__(self, entry: str, bblocks: list[BasicBlock]):
+    self.entry = entry
+    self.bblocks = bblocks
+
+  def analyze(self):
+    # Helper maps
+    self.bblock_map = {}
+    self.inst_map = {}
+    uid = 0
+    for blk in self.bblocks:
+      blk.analyze()
+      blk.pred = []
+      self.bblock_map[blk.label] = blk
+      for inst in blk.insts:
+        inst.uid = uid
+        self.inst_map[uid] = inst
+        uid += 1
+
+    # Analyize block-level control flow
+    num_stop_succ = 0
+    for blk in self.bblocks:
+      if len(blk.succ) < 1 and len(blk.succ) > 2:
+        raise RuntimeError(f"BasicBlock {blk.label} has {len(blk.succ)} successors (must be 1 or 2)")
+      for succ in blk.succ:
+        if succ == "stop":
+          num_stop_succ += 1
+        else:
+          self.bblock_map[succ].pred.append(blk.label)
+    
+    if num_stop_succ != 1:
+      raise RuntimeError(f"Cfg must have exactly one bblock with one 'stop' as successor, found {num_stop_succ}")
+
+    # Determine instruction-level control flow
+    for blk in self.bblocks:
+      # First instruction has the last instruction of the previous block as pred 
+      for pred_blk_name in blk.pred:
+        blk.insts[0].pred.append(self.bblock_map[pred_blk_name].insts[-1])
+
+      # Last instruction has the first instruction of the next block as succ
+      for succ_blk_name in blk.succ:
+        if succ_blk_name != "stop":
+          blk.insts[-1].succ.append(self.bblock_map[succ_blk_name].insts[0])
+
+    # Print all instructions
+    for uid in self.inst_map:
+      inst = self.inst_map[uid]
+      print(f"inst {uid}, pred {[i.uid for i in inst.pred]}, succ: {[i.uid for i in inst.succ]}, defs: {inst.defs()}, uses: {inst.uses()}: {str(inst)}")
+
+    # Liveness analysis
+    w = []
+    for uid in self.inst_map:
+      inst = self.inst_map[uid] 
+      inst.in_set = set()
+      inst.out_set = set()
+      w.append(inst)
+    
+    while len(w) > 1:
+      n = w.pop()
+      old_in = n.in_set
+
+      new_out = set()
+      for i in n.succ:
+        new_out = new_out | i.in_set
+      n.out_set = new_out
+
+      new_in = n.uses() | (new_out - n.defs())
+      n.in_set = new_in
+
+      if (new_in != old_in):
+        for m in n.pred:
+          w.append(m)
+
+    # Print liveness
+    required_registers = 0
+    for uid in self.inst_map:
+      inst = self.inst_map[uid]
+      required_registers = max(required_registers, len(inst.in_set | inst.out_set))
+      print(f"inst {uid}: in: {inst.in_set} out: {inst.out_set}")
+    
+    print(f"Required registers: {required_registers}")
+
+    if required_registers > bgpu_max_registers:
+      raise RuntimeError(f"Kernel requires more than {bgpu_max_registers} registers, spilling not yet implemented!")
+
+    # Linear register allocator
+    pal = set([i for i in range(bgpu_max_registers)])
+    reg_map = {}
+
+    # Precolor phi nodes -> all should have the same register
+    available_regs = list(pal)
+    available_regs.sort(reverse=True)
+    for uid in self.inst_map:
+      inst = self.inst_map[uid]
+      if inst.op != "phi":
+        continue
+      reg = available_regs.pop()
+      # Force srcs to use the same register
+      for src in inst.srcs:
+        reg_map[src] = reg
+
+      # convert to rr move
+      inst.op = "mov.rr.int32"
+      inst.srcs = [inst.srcs[0]]
+
+    # Color remaining registers
+    for uid in self.inst_map:
+      inst = self.inst_map[uid]
+      live = inst.in_set | inst.out_set
+      used = set()
+      for reg in live:
+        if reg in reg_map:
+          used.add(reg_map[reg])
+      print(f"inst {uid}: live: {live} used: {used}")
+      available_regs = list(pal - used)
+      available_regs.sort(reverse=True)
+      for d in inst.defs():
+        if d not in reg_map:
+          reg_map[d] = available_regs.pop()
+          print(f"{d} : {reg_map[d]}")
+
+    # Replace registers
+    for uid in self.inst_map:
+      inst = self.inst_map[uid]
+      if inst.dst is not None:
+        inst.dst = f"r{reg_map[inst.dst]}"
+      new_srcs = []
+      for src in inst.srcs:
+        new_srcs.append(f"r{reg_map[src]}")
+      inst.srcs = new_srcs
+
+  def render(self):
+    res = ""
+    for blk in self.bblocks:
+      res += str(blk)
+    return res
+
+  def __str__(self):
+    return f"CFG, entry: {self.entry}\n" + self.render()
+
+  def from_uops(uops: list[UOp]):
+    print("Creating Cfg for:")
+    print_uops(uops)
+
+    bblocks = []
+
+    entry_name = "UNDEFINED"
+    current_bblock_label = "UNDEFINED"
+    current_bblock_insts = []
+    uop_to_ssa = {}
+    idx = 0
+    def ssa(uop=None):
+      nonlocal idx
+      name = f"%{idx}"
+      idx += 1
+      if uop is not None:
+        uop_to_ssa[uop] = name
+      return name
+
+    def get_srcs(uop):
+      return [uop_to_ssa[src] for src in uop.src]
+      
+    for idx, uop in enumerate(uops):
+      if uop.op is Ops.DEFINE_GLOBAL:
+        current_bblock_insts.append(Quadruple(f"ldparam.{types[bgpu_addr_type]}", ssa(uop), srcs=[], args=uop.arg))
+      elif uop.op is Ops.DEFINE_REG:
+        regs = []
+        for _ in range(uop.dtype.size):
+          regs.append(ssa())
+        uop_to_ssa[uop] = regs
+      elif uop.op is Ops.CONST:
+        current_bblock_insts.append(Quadruple(f"mov.ri.{types[uop.dtype]}", ssa(uop), args=uop.arg))
+      elif uop.op is Ops.SPECIAL:
+        current_bblock_insts.append(Quadruple("special", ssa(uop), args=f"%{uop.arg[0]}"))
+      elif uop.op in GroupOp.ALU:
+        current_bblock_insts.append(Quadruple(f"{uop.op.name.lower()}.rr.{types[uop.dtype]}", ssa(uop), srcs=get_srcs(uop)))
+      elif uop.op is Ops.INDEX:
+        if uop.dtype.addrspace == AddrSpace.GLOBAL:
+          if uop.dtype.base.itemsize > 1:
+            shift_name = ssa(uop)
+            shift_val = int(math.log2(uop.src[0].dtype.base.itemsize))
+            current_bblock_insts.append(Quadruple(f"shl.ri.{types[bgpu_addr_type]}", shift_name, srcs=[uop_to_ssa[uop.src[1]]], args=str(shift_val)))
+            current_bblock_insts.append(Quadruple(f"add.rr.{types[bgpu_addr_type]}", shift_name, srcs=[uop_to_ssa[uop.src[0]], shift_name]))
+          else:
+            current_bblock_insts.append(Quadruple(f"add.rr.{types[bgpu_addr_type]}", ssa(uop), srcs=get_srcs(uop)))
+        elif uop.dtype.addrspace == AddrSpace.REG:
+          assert uop.src[1].op == Ops.CONST
+          uop_to_ssa[uop] = uop_to_ssa[uop.src[0]][uop.src[1].arg]
+        else:
+          raise NotImplementedError(f"Index not implemented for {uop.dtype.addrspace}")
+      elif uop.op is Ops.LOAD:
+        if uop.src[0].dtype.addrspace == AddrSpace.GLOBAL:
+          current_bblock_insts.append(Quadruple(f"ld.{types[uop.dtype]}.global", ssa(uop), srcs=get_srcs(uop)))
+        elif uop.src[0].dtype.addrspace == AddrSpace.REG:
+          current_bblock_insts.append(Quadruple(f"mov.rr.{types[uop.dtype.base]}", ssa(uop), srcs=get_srcs(uop)))
+        else:
+          raise NotImplementedError(f"Load not implemented for {uop.src[0].dtype.addrspace}")
+      elif uop.op is Ops.STORE:
+        if uop.src[0].dtype.addrspace == AddrSpace.REG:
+          current_bblock_insts.append(Quadruple(f"mov.rr.{types[uop.src[0].dtype.base]}", uop_to_ssa[uop.src[0]], srcs=[uop_to_ssa[uop.src[1]]]))
+          uop_to_ssa[uop] = uop_to_ssa[uop.src[0]]
+        else:
+          current_bblock_insts.append(Quadruple(f"st.{types[uop.src[0].dtype.base]}.global", None, srcs=get_srcs(uop)))
+      elif uop.op is Ops.RANGE:
+        if uop.src[0].arg <= 0:
+          raise RuntimeError(f"Range has 0 or fewer iterations: {uop.src[0].arg}")
+        range_name = ssa(uop)
+        loop_entry_name = f"loop_entry_{range_name}"
+        loop_check_name = f"loop_check_{range_name}"
+        loop_body_name = f"loop_body_{range_name}"
+        loop_exit_name = f"loop_exit_{range_name}"
+        # close basic block -> succ is loop_entry
+        bblocks.append(
+          BasicBlock(current_bblock_label, current_bblock_insts, [loop_entry_name])
+        )
+        # loop entry basic block -> succ is loop_check
+        # initialize counter
+        counter_init_name = f"%{loop_entry_name}_init"
+        bblocks.append(
+          BasicBlock(loop_entry_name, [Quadruple(f"mov.ri.{types[uop.dtype]}", counter_init_name, args="0")], [loop_check_name])
+        )
+        # loop check basic block
+        bblocks.append(
+          BasicBlock(loop_check_name, [
+            Quadruple("phi", range_name, srcs=[f"{range_name}_phi", counter_init_name]),
+            Quadruple(f"add.ri.{types[uop.dtype]}", f"{range_name}_phi", srcs=[range_name], args="1"),
+            Quadruple(f"sub.ri.{types[uop.dtype]}", f"{range_name}_cmp", srcs=[f"{range_name}_phi"], args=uop.src[0].arg+1),
+            Quadruple(f"br.ez.{loop_exit_name}", srcs=[f"{range_name}_cmp"])
+          ],
+          [loop_body_name, loop_exit_name])
+        )
+        # We are now in the loop_body_name
+        current_bblock_label = loop_body_name
+        current_bblock_insts = []
+      elif uop.op is Ops.AFTER:
+        uop_to_ssa[uop] = uop_to_ssa[uop.src[0]]
+      elif uop.op is Ops.END:
+        # close basic block
+        range_name = uop_to_ssa[uop.src[1]]
+        loop_check_name = f"loop_check_{range_name}"
+        loop_footer_name = f"loop_footer_{range_name}"
+        loop_exit_name = f"loop_exit_{range_name}"
+        # close basic block -> succ is loop_footer
+        bblocks.append(
+          BasicBlock(current_bblock_label, current_bblock_insts, [loop_footer_name])
+        )
+        # loop footer jumps to loop check
+        bblocks.append(
+          BasicBlock(loop_footer_name, [Quadruple(f"br.nz.{loop_check_name}", srcs=[f"{range_name}_cmp"])], [loop_check_name])
+        )
+        # start loop exit block
+        current_bblock_label = loop_exit_name
+        current_bblock_insts = []
+      elif uop.op is Ops.SINK:
+        entry_name = uop.arg.name
+        if len(bblocks) == 0:
+          current_bblock_label = entry_name
+        else:
+          bblocks[0].label = entry_name
+      elif uop.op is Ops.GROUP:
+        continue
+      else:
+        print("Previous blocks:")
+        for b in bblocks:
+          print(b.__str__())
+
+        print("Current block:")
+        print(f"{current_bblock_label}:")
+        for inst in current_bblock_insts:
+          print(f"\t{inst}")
+        raise NotImplementedError(f"Uop {uop.op} not implemented!")
+
+    bblocks.append(
+      BasicBlock(current_bblock_label, current_bblock_insts, ["stop"])
+    )
+
+    return Cfg(entry_name, bblocks)
 
 class BGPURenderer(Renderer):
   device = "BGPU"
@@ -184,18 +530,6 @@ class BGPURenderer(Renderer):
   pre_matcher = None
   extra_matcher = None
   code_for_op = asm_for_op
-
-  types: dict[DType, str] = {
-    dtypes.void: "void",
-    dtypes.char: "int8",
-    dtypes.uchar: "uint8",
-    dtypes.short: "int16",
-    dtypes.int: "int32",
-    dtypes.uint: "uint32",
-    dtypes.bool: "bool",
-    dtypes.float: "float32",
-    dtypes.long: "long"
-  }
 
   def render_kernel(self, function_name):
     kernel:list[str] = []
@@ -233,6 +567,14 @@ class BGPURenderer(Renderer):
   def render(self, uops:list[UOp]) -> str:
     print("Rendering BGPU code")
 
+    cfg = Cfg.from_uops(uops)
+    print(cfg)
+    cfg.analyze()
+    print(cfg)
+
+    if new_codegen:
+      return cfg.render()
+
     function_name = "BGPU_KERNEL"
 
     bufs = []
@@ -251,7 +593,7 @@ class BGPURenderer(Renderer):
     def ssa(prefix:str, u:UOp|None=None, dtype:str|None=None) -> str:
       nonlocal c, r
       # print(f"ssa({prefix}, {u}, {dtype})")
-      prefix += f"_{dtype if dtype is not None else self.types[cast(UOp, u).dtype]}_"
+      prefix += f"_{dtype if dtype is not None else types[cast(UOp, u).dtype]}_"
       c[prefix] += 1
       return f"%{prefix}{c[prefix]-1}"
 
@@ -364,21 +706,21 @@ class BGPURenderer(Renderer):
         continue
       elif u.op is Ops.LOAD:
         # assert u.src[0].dtype == bgpu_addr_type, f"address of load isn't {bgpu_addr_type} but {u.src[0].dtype}"
-        r[u] = [ssa('val', dtype=self.types[u.dtype.scalar()]) for _ in range(u.dtype.count)] if u.dtype.count > 1 else ssa('val', u)
+        r[u] = [ssa('val', dtype=types[u.dtype.scalar()]) for _ in range(u.dtype.count)] if u.dtype.count > 1 else ssa('val', u)
         continue
       elif u.op is Ops.DEFINE_GLOBAL: 
         print(f"global {u.arg} of type {u.dtype}")
         bufs.append((f"data{u.arg}", u.dtype))
       
       prefix, dtype = {
-          Ops.END: ("range_cond", self.types[dtypes.int]),
-          Ops.RANGE: ("range", self.types[u.dtype.base.scalar()]),
-          Ops.INDEX: ("idx", self.types[u.dtype.base.scalar()]),
+          Ops.END: ("range_cond", types[dtypes.int]),
+          Ops.RANGE: ("range", types[u.dtype.base.scalar()]),
+          Ops.INDEX: ("idx", types[u.dtype.base.scalar()]),
           Ops.CAST: ("cast", None),
           Ops.BITCAST: ("cast", None),
           Ops.CONST: ("const", None),
-          Ops.DEFINE_GLOBAL: ("param", self.types[bgpu_widest_type]),
-          Ops.DEFINE_REG: ("reg", self.types[u.dtype.base.scalar()]),
+          Ops.DEFINE_GLOBAL: ("param", types[bgpu_widest_type]),
+          Ops.DEFINE_REG: ("reg", types[u.dtype.base.scalar()]),
           **{op: ("alu", None) for op in GroupOp.ALU}
         }.get(u.op, (None, None))
       if prefix:
@@ -449,7 +791,7 @@ class BGPURenderer(Renderer):
         # Goto next register
         reg_idx += 1
 
-      if not has_range:
+      if not has_range and False:
       # TODO: This does not work if there are loops -> we just never free registers
       # Check if we can free a register
       # If the register is used last in current uop, then we can use it as destination for this uop
