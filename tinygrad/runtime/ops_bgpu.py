@@ -373,21 +373,25 @@ class Cfg:
         # initialize counter
         counter_init_name = f"%{loop_entry_name}_init"
         bblocks.append(
-          BasicBlock(loop_entry_name, [Quadruple(f"mov.ri.{types[uop.dtype]}", counter_init_name, args="0")], [loop_check_name])
+          BasicBlock(loop_entry_name, [
+            Quadruple(f"mov.ri.{types[uop.dtype]}", counter_init_name, args="0"),
+            Quadruple(f"mov.ri.{types[uop.dtype]}", f"{range_name}_limit", args=uop.src[0].arg),
+          ], [loop_check_name])
         )
         # loop check basic block
         bblocks.append(
           BasicBlock(loop_check_name, [
             Quadruple("phi", range_name, srcs=[f"{range_name}_phi", counter_init_name]),
-            Quadruple(f"add.ri.{types[uop.dtype]}", f"{range_name}_phi", srcs=[range_name], args="1"),
-            Quadruple(f"sub.ri.{types[uop.dtype]}", f"{range_name}_cmp", srcs=[f"{range_name}_phi"], args=uop.src[0].arg+1),
+            Quadruple(f"sub.rr.{types[uop.dtype]}", f"{range_name}_cmp", srcs=[range_name, f"{range_name}_limit"]),
             Quadruple(f"br.ez.{loop_exit_name}", srcs=[f"{range_name}_cmp"], never_dead=True)
           ],
           [loop_body_name, loop_exit_name])
         )
         # We are now in the loop_body_name
         current_bblock_label = loop_body_name
-        current_bblock_insts = []
+        current_bblock_insts = [
+          Quadruple(f"add.ri.{types[uop.dtype]}", f"{range_name}_phi", srcs=[range_name], args="1"),
+        ]
       elif uop.op is Ops.AFTER:
         alloca_regs[uop] = alloca_regs[uop.src[0]] # map to alloca'd regs
       elif uop.op is Ops.END:
