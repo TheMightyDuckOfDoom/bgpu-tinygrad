@@ -5,9 +5,9 @@ os.environ["DEBUG"] = "7"
 from tinygrad import dtypes
 from tinygrad import Tensor
 
-dtype = dtypes.float32
+dtype = dtypes.int32
 
-height = 16
+height = 8
 width  = height
 
 v0 = []
@@ -20,5 +20,5 @@ t0 = Tensor(v0, dtype=dtype).reshape(height, width)
 t1 = Tensor(v1, dtype=dtype).reshape(width, height)
 
 # t2 = t0.sum(axis=0)
-t2 = (t0 @ (t1 + 1))
+t2 = (t0 @ (t1 + 1)).sum(axis=1)
 print(t2.numpy())

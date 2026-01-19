@@ -19,6 +19,7 @@ bgpu_global_size = 1 << 16
 bgpu_local_size = 8
 bgpu_max_registers = 256
 new_codegen = True
+LD_REG_OPTIMIZATION = True
 DEAD_CODE_ELIMINATION = True
 
 class BGPUProgram:
@@ -250,6 +251,7 @@ class Cfg:
     # Helper maps
     self.bblock_map = {}
     self.inst_map = {}
+    self.ld_reg_map = {} # ld_reg to alloca map
     uid = 0
     for blk in self.bblocks:
       blk.analyze()
@@ -259,8 +261,10 @@ class Cfg:
         inst.uid = uid
         self.inst_map[uid] = inst
         uid += 1
+        if inst.op == "ld_reg":
+          self.ld_reg_map[inst.dst] = inst.srcs[0]
 
-    # Analyize block-level control flow
+    # Analize block-level control flow
     num_stop_succ = 0
     for blk in self.bblocks:
       if len(blk.succ) < 1 and len(blk.succ) > 2:
@@ -289,6 +293,19 @@ class Cfg:
     for uid in self.inst_map:
       inst = self.inst_map[uid]
       print(f"inst {uid}, pred {[i.uid for i in inst.pred]}, succ: {[i.uid for i in inst.succ]}, defs: {inst.defs()}, uses: {inst.uses()}: {str(inst)}")
+
+    # ld_reg optimization: replace uses of ld_reg dst with alloca src
+    if LD_REG_OPTIMIZATION:
+      for uid in self.inst_map:
+        inst = self.inst_map[uid]
+        new_srcs = []
+        for src in inst.srcs:
+          if src in self.ld_reg_map:
+            new_srcs.append(self.ld_reg_map[src])
+            print(f"Optimizing ld_reg: replacing use of {src} with {self.ld_reg_map[src]}")
+          else:
+            new_srcs.append(src)
+        inst.srcs = new_srcs
 
     # Liveness analysis
     w = []
@@ -374,6 +391,17 @@ class Cfg:
         new_srcs.append(f"r{reg_map[src]}")
       inst.srcs = new_srcs
 
+    # Replace alloca, ld_reg and st_reg
+    # TODO: Proper mem2reg implementation
+    for uid in self.inst_map:
+      inst = self.inst_map[uid]
+      if inst.op == "alloca":
+        inst.dead = True # Just reserve the register
+      elif inst.op == "ld_reg":
+        inst.op = "mov.rr.int32"
+      elif inst.op == "st_reg":
+        inst.op = "mov.rr.int32"
+
   def render(self):
     res = ""
     for blk in self.bblocks:
@@ -405,14 +433,16 @@ class Cfg:
     def get_srcs(uop):
       return [uop_to_ssa[src] for src in uop.src]
       
-    for idx, uop in enumerate(uops):
+    alloca_regs = {}
+    for uop in uops:
       if uop.op is Ops.DEFINE_GLOBAL:
         current_bblock_insts.append(Quadruple(f"ldparam.{types[bgpu_addr_type]}", ssa(uop), srcs=[], args=uop.arg))
       elif uop.op is Ops.DEFINE_REG:
-        regs = []
         for _ in range(uop.dtype.size):
-          regs.append(ssa())
-        uop_to_ssa[uop] = regs
+          new_regs = [ssa() for _ in range(uop.dtype.size)]
+          for r in new_regs:
+            current_bblock_insts.append(Quadruple(f"alloca", r, args=uop.arg))
+          alloca_regs[uop] = new_regs
       elif uop.op is Ops.CONST:
         current_bblock_insts.append(Quadruple(f"mov.ri.{types[uop.dtype]}", ssa(uop), args=uop.arg))
       elif uop.op is Ops.SPECIAL:
@@ -430,20 +460,20 @@ class Cfg:
             current_bblock_insts.append(Quadruple(f"add.rr.{types[bgpu_addr_type]}", ssa(uop), srcs=get_srcs(uop)))
         elif uop.dtype.addrspace == AddrSpace.REG:
           assert uop.src[1].op == Ops.CONST
-          uop_to_ssa[uop] = uop_to_ssa[uop.src[0]][uop.src[1].arg]
+          print(f"index into register {uop.src[0]} at constant {uop.src[1].arg}")
+          uop_to_ssa[uop] = alloca_regs[uop.src[0]][uop.src[1].arg]
         else:
           raise NotImplementedError(f"Index not implemented for {uop.dtype.addrspace}")
       elif uop.op is Ops.LOAD:
         if uop.src[0].dtype.addrspace == AddrSpace.GLOBAL:
           current_bblock_insts.append(Quadruple(f"ld.{types[uop.dtype]}.global", ssa(uop), srcs=get_srcs(uop)))
         elif uop.src[0].dtype.addrspace == AddrSpace.REG:
-          current_bblock_insts.append(Quadruple(f"mov.rr.{types[uop.dtype.base]}", ssa(uop), srcs=get_srcs(uop)))
+          current_bblock_insts.append(Quadruple(f"ld_reg", ssa(uop), srcs=get_srcs(uop)))
         else:
           raise NotImplementedError(f"Load not implemented for {uop.src[0].dtype.addrspace}")
       elif uop.op is Ops.STORE:
         if uop.src[0].dtype.addrspace == AddrSpace.REG:
-          current_bblock_insts.append(Quadruple(f"mov.rr.{types[uop.src[0].dtype.base]}", uop_to_ssa[uop.src[0]], srcs=[uop_to_ssa[uop.src[1]]]))
-          uop_to_ssa[uop] = uop_to_ssa[uop.src[0]]
+          current_bblock_insts.append(Quadruple(f"st_reg", None, srcs=get_srcs(uop), never_dead=True))
         else:
           current_bblock_insts.append(Quadruple(f"st.{types[uop.src[0].dtype.base]}.global", None, srcs=get_srcs(uop), never_dead=True))
       elif uop.op is Ops.RANGE:
@@ -478,7 +508,7 @@ class Cfg:
         current_bblock_label = loop_body_name
         current_bblock_insts = []
       elif uop.op is Ops.AFTER:
-        uop_to_ssa[uop] = uop_to_ssa[uop.src[0]]
+        alloca_regs[uop] = alloca_regs[uop.src[0]] # map to alloca'd regs
       elif uop.op is Ops.END:
         # close basic block
         range_name = uop_to_ssa[uop.src[1]]
