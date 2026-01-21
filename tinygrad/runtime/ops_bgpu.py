@@ -10,10 +10,13 @@ from bgpu_driver import BGPUDriver
 import math
 import functools
 
+import os
+BGPU_EMU = os.environ.get("BGPU_EMU", "0") == "1"
+
 bgpu_addr_type = dtypes.int
 
 bgpu_global_size = 1 << 16
-bgpu_local_size = 8
+bgpu_local_size = 4
 bgpu_max_registers = 256
 new_codegen = True
 LD_REG_OPTIMIZATION = True
@@ -491,5 +494,5 @@ class BGPUAllocator(LRUAllocator['BGPUDevice']):
 
 class BGPUDevice(Compiled):
   def __init__(self, device:str):
-    self.driver = BGPUDriver()
+    self.driver = BGPUDriver(BGPU_EMU)
     super().__init__(device, BGPUAllocator(self), CompilerSet([CompilerPair(BGPURenderer, Compiler)]), functools.partial(BGPUProgram, self))

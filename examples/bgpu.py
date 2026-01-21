@@ -5,7 +5,7 @@ os.environ["DEBUG"] = "7"
 from tinygrad import dtypes
 from tinygrad import Tensor
 
-dtype = dtypes.int32
+dtype = dtypes.float32
 
 height = 8
 width  = height
